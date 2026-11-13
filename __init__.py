@@ -48,13 +48,33 @@ class TfwrCompanionPlugin(NekoPluginBase):
         user = tfr.resolve_user_dir(cfg)
         return user, tfr.save_dir(user, str(cfg.get("save_name") or "Save0"))
 
+    @staticmethod
+    def _check_write(cfg: dict, user: Path) -> None:
+        if not bool(cfg.get("allow_write", True)):
+            raise SdkError("配置里 allow_write=false，已拒绝写盘")
+        exe = str(cfg.get("game_exe") or tfr.GAME_EXE)
+        if tfr.is_game_running(exe) and tfr.read_options(user).get("file watcher") != "enabled":
+            raise SdkError(
+                "游戏正在运行且 file watcher 未开启：写入会被游戏退出时覆盖。"
+                "请先关游戏，或用 tfr_code action=watcher value=enabled 开启文件监视。"
+            )
+
+    @staticmethod
+    def _verify(cfg: dict) -> bool:
+        return tfr.verify_enabled(cfg, tfr.resolve_game_dir(cfg))
+
     # --------------------------------------------------------------------- ops
 
     async def _status(self) -> dict:
         cfg = await self._cfg()
         user, sdir = self._paths(cfg)
         exe = str(cfg.get("game_exe") or tfr.GAME_EXE)
+        game = tfr.resolve_game_dir(cfg)
         out = {
+            "game_dir": str(game) if game else None,
+            "game_exe_present": bool(game and (game / exe).exists()),
+            "verify_game": str(cfg.get("verify_game", "auto")),
+            "verify": tfr.verify_enabled(cfg, game),
             "user_dir": str(user),
             "save_dir": str(sdir),
             "save_exists": sdir.exists(),
@@ -115,22 +135,19 @@ class TfwrCompanionPlugin(NekoPluginBase):
         if action == "read":
             return {"file": file, "code": tfr.read_code(sdir, file)}
         if action == "write":
+            self._check_write(cfg, user)
+            return tfr.write_code(sdir, file, code, verify=self._verify(cfg))
+        if action == "watcher":
             if not bool(cfg.get("allow_write", True)):
                 raise SdkError("配置里 allow_write=false，已拒绝写盘")
-            exe = str(cfg.get("game_exe") or tfr.GAME_EXE)
-            watcher = tfr.read_options(user).get("file watcher")
-            if tfr.is_game_running(exe) and watcher != "enabled":
-                raise SdkError(
-                    "游戏正在运行且 file watcher 未开启：写入会被游戏退出时覆盖。"
-                    "请先关游戏，或用 tfr_code action=watcher value=enabled 开启文件监视。"
-                )
-            return tfr.write_code(sdir, file, code)
-        if action == "watcher":
             if tfr.is_game_running(str(cfg.get("game_exe") or tfr.GAME_EXE)):
                 raise SdkError("游戏正在运行；options.txt 会在退出时被覆盖，请先关游戏")
             if value not in ("enabled", "disabled"):
                 raise SdkError("value 只能是 enabled 或 disabled")
-            return tfr.set_option(user, "file watcher", value)
+            result = tfr.set_option(user, "file watcher", value)
+            if self._verify(cfg):
+                result["verified"] = tfr.read_options(user).get("file watcher") == value
+            return result
         raise SdkError(f"未知 action：{action}")
 
     async def _run_op(self, action: str = "run", wait_seconds: float = 6.0) -> dict:
@@ -147,9 +164,9 @@ class TfwrCompanionPlugin(NekoPluginBase):
         if not bool(cfg.get("allow_input", True)):
             raise SdkError("配置里 allow_input=false；请手动按 F5，再用 tfr_run action=check 验收")
         if action == "stop":
-            return {"sent": tfr.send_game_keys(exe=exe, stop_first=True)}
+            return {"sent": await asyncio.to_thread(tfr.send_game_keys, exe=exe, stop_first=True)}
         if action == "run":
-            return tfr.run_and_check(user, sdir, wait_seconds, exe)
+            return await asyncio.to_thread(tfr.run_and_check, user, sdir, wait_seconds, exe)
         raise SdkError(f"未知 action：{action}")
 
     def _watch_status(self) -> dict:
@@ -196,7 +213,7 @@ class TfwrCompanionPlugin(NekoPluginBase):
                 if current != self._watch_last:
                     self._watch_last = current
                     if bool(cfg.get("auto_run", True)) and bool(cfg.get("allow_input", True)) and tfr.is_game_running(exe):
-                        tfr.send_game_keys(exe=exe, stop_first=True)
+                        await asyncio.to_thread(tfr.send_game_keys, exe=exe, stop_first=True)
                         self._watch_last_run = tfr.now_stamp()
                     self._watch_error = None
             except Exception as exc:
@@ -224,15 +241,20 @@ class TfwrCompanionPlugin(NekoPluginBase):
                 "last_output": tfr.parse_output(tfr.read_output(user)),
                 "save": tfr.save_summary(tfr.read_save(sdir)),
                 "auto_run": self._watch_status(),
-                "hint": "先用 tfr_docs search 查 API，再 tfr_solve action=apply file=main code=...；插件会自动执行并返回 output。",
+                "hint": "先用 tfr_docs search 查 API，再 tfr_solve action=apply file=main code=...；"
+                "auto_run 开着且游戏在运行时插件会自动执行，返回里的 ran=false 表示这次没执行、output 是旧的。",
             }
         if action == "apply":
             if not code:
                 raise SdkError("apply 需要 code")
-            written = tfr.write_code(sdir, file, code)
+            self._check_write(cfg, user)
+            before = self._watch_last_run
+            written = tfr.write_code(sdir, file, code, verify=self._verify(cfg))
             await asyncio.sleep(min(max(float(wait_seconds), 2.0), 30.0))
             return {
                 "written": written,
+                "ran": self._watch_last_run != before,
+                "auto_run": self._watch_status(),
                 "output": tfr.parse_output(tfr.read_output(user)),
                 "save": tfr.save_summary(tfr.read_save(sdir)),
             }
@@ -307,7 +329,7 @@ class TfwrCompanionPlugin(NekoPluginBase):
     @plugin_entry(
         id="tfr_solve",
         name="自动写码闭环",
-        description="context=读取当前代码/输出/存档；apply=写代码并等待自动执行后返回结果。",
+        description="context=读取当前代码/输出/存档；apply=写代码，等待自动执行（auto_run）后返回结果，ran 表示是否真的执行了。",
     )
     async def tfr_solve(
         self,
@@ -416,7 +438,7 @@ class TfwrCompanionPlugin(NekoPluginBase):
 
     @llm_tool(
         name="tfr_solve",
-        description="《The Farmer Was Replaced》自动写码闭环：context 读当前代码/输出/存档，apply 写代码并自动执行后返回结果。",
+        description="《The Farmer Was Replaced》自动写码闭环：context 读当前代码/输出/存档，apply 写代码并等待自动执行后返回结果（ran=false 表示没执行、输出是旧的）。",
         parameters={
             "type": "object",
             "properties": {
@@ -444,7 +466,10 @@ class TfwrCompanionPlugin(NekoPluginBase):
         cfg = await self._cfg()
         user, sdir = self._paths(cfg)
         try:
-            self._install_result = await asyncio.to_thread(tfr_install.install, cfg)
+            if bool(cfg.get("allow_write", True)):
+                self._install_result = await asyncio.to_thread(tfr_install.install, cfg)
+            else:
+                self._install_result = {"ok": False, "stage": "disabled", "reason": "allow_write=false，未改动 options.txt"}
         except Exception as exc:
             self._install_result = {"ok": False, "stage": "error", "reason": f"{type(exc).__name__}: {exc}"}
         if bool(cfg.get("auto_run", True)):

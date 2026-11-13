@@ -26,16 +26,19 @@
 | `tfr_docs` | `list` / `search` / `read` 内置 API 文档 |
 | `tfr_code` | `list` / `read` / `write` / `watcher` |
 | `tfr_run` | `run` 执行并验收 / `stop` / `check` 只读验收 |
+| `tfr_watch` | `start` / `stop` / `status`：代码文件变化后自动 Shift+F5→F5 |
+| `tfr_solve` | `context` 读代码/输出/存档；`apply` 写代码并等待自动执行，返回 `ran` 表示是否真的执行了 |
 
 ## 使用前提
 
-1. 游戏内把 `file watcher` 打开（或用 `tfr_code action=watcher value=enabled`，需先关游戏）。
+1. 游戏内把 `file watcher` 打开（或用 `tfr_code action=watcher value=enabled`，需先关游戏）。插件只在启动时、游戏没运行且 `allow_write = true` 时自动打开一次；游戏开着启动插件的话，退出游戏后要重启插件或手动开。
 2. 插件配置里 `allow_input = true`（默认），否则只能手动按 F5 再用 `tfr_run action=check`。
 
 ## 安全边界
 
 - 写代码前备份到 `Saves/Save0/.bak/`。
-- 游戏运行时且文件监视关闭 → 拒绝写入（否则会被游戏退出时覆盖）。
+- `allow_write = false` 或「游戏运行时且文件监视关闭」→ `tfr_code write` 和 `tfr_solve apply` 都拒绝写入（否则会被游戏退出时覆盖）；`allow_write = false` 时 `tfr_code watcher` 和启动时自动开 file watcher 也不写 options.txt。
+- `verify_game`（`auto` = 检测到游戏安装才开）：`tfr_status` 报告安装目录和 exe 是否存在；开启时写入后回读校验。`tfr_run run` 本身就用 `output.txt` 与 `save.json` 的前后差异验收。
 - 发键前用 PID 找到游戏窗口，只对游戏进程的窗口操作。
 
 ## 自检
