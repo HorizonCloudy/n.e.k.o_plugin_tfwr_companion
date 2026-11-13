@@ -232,7 +232,7 @@ def write_code(sdir: Path, name: str, code: str, verify: bool = False) -> dict:
         backup = bdir / f"{path.name}.{now_stamp()}.bak"
         shutil.copy2(path, backup)
     text = (code or "").replace("\r\n", "\n").replace("\r", "\n")
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
     out = {"file": path.name, "bytes": len(text.encode("utf-8")), "backup": str(backup) if backup else None}
@@ -278,7 +278,7 @@ def set_option(user: Path, key: str, value: str) -> dict:
         lines.append(f"{key} = {value}")
     backup = path.with_name(f"{path.name}.bak-{now_stamp()}")
     shutil.copy2(path, backup)
-    tmp = path.with_name(".options.txt.tmp")
+    tmp = path.with_name(f".options.txt.tmp-{time.time_ns()}")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return {"option": key, "value": value, "backup": str(backup)}
@@ -312,6 +312,15 @@ def output_path(user: Path) -> Path:
 def read_output(user: Path) -> str:
     path = output_path(user)
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def output_state(user: Path) -> tuple[int, int]:
+    """output.txt 的 (mtime_ns, 字节数)。用来判断这次按键后游戏到底有没有写新输出。"""
+    try:
+        st = output_path(user).stat()
+    except OSError:
+        return 0, 0
+    return st.st_mtime_ns, st.st_size
 
 
 def parse_output(text: str) -> dict:
@@ -370,8 +379,11 @@ def find_window(pid: int):
     return (titled or [hwnd for hwnd, _ in found] or [None])[0]
 
 
-def send_game_keys(exe: str = GAME_EXE, stop_first: bool = True) -> dict:
-    """把游戏窗口切到前台，Shift+F5 停，再 F5 开。只认游戏进程的窗口。"""
+def send_game_keys(exe: str = GAME_EXE, stop_first: bool = True, press_run: bool = True) -> dict:
+    """把游戏窗口切到前台再发键。stop_first 指定先按 Shift+F5 停，press_run 指定再按 F5 开。
+
+    只认游戏进程的窗口。只想停不想重新开，调 stop_game_keys()。
+    """
     if os.name != "nt":
         raise RuntimeError("只支持 Windows")
     pid = game_pid(exe)
@@ -409,21 +421,39 @@ def send_game_keys(exe: str = GAME_EXE, stop_first: bool = True) -> dict:
         user32.keybd_event(vk, 0, 0, 0)
         user32.keybd_event(vk, 0, keyup, 0)
 
+    steps = []
     if stop_first:
         user32.keybd_event(vk_shift, 0, 0, 0)
         tap(vk_f5)
         user32.keybd_event(vk_shift, 0, keyup, 0)
+        steps.append("Shift+F5")
         time.sleep(0.4)
-    tap(vk_f5)
-    return {"pid": pid, "hwnd": int(hwnd), "sent": "Shift+F5 then F5"}
+    if press_run:
+        tap(vk_f5)
+        steps.append("F5")
+    return {"pid": pid, "hwnd": int(hwnd), "sent": " then ".join(steps)}
+
+
+def stop_game_keys(exe: str = GAME_EXE) -> dict:
+    """只按 Shift+F5 停住执行，不再按 F5 重启。"""
+    return send_game_keys(exe=exe, stop_first=True, press_run=False)
 
 
 def run_and_check(user: Path, sdir: Path, wait_seconds: float = 6.0, exe: str = GAME_EXE) -> dict:
     before_text = read_output(user)
+    before_state = output_state(user)
     before_items = items(read_save(sdir))
     sent = send_game_keys(exe=exe)
-    time.sleep(max(1.0, min(float(wait_seconds or 6), 60.0)))
+    limit = max(1.0, min(float(wait_seconds or 6), 60.0))
+    started = time.monotonic()
+    deadline = started + limit
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        if output_state(user) != before_state:
+            break
+    waited = round(min(limit, time.monotonic() - started), 2)
     after_text = read_output(user)
+    after_state = output_state(user)
     after_items = items(read_save(sdir))
 
     delta_text = after_text[len(before_text):] if after_text.startswith(before_text) else after_text
@@ -444,12 +474,14 @@ def run_and_check(user: Path, sdir: Path, wait_seconds: float = 6.0, exe: str = 
     return {
         "verdict": verdict,
         "sent": sent,
-        "output_changed": after_text != before_text,
+        "output_changed": after_state != before_state,
+        "output_state_before": list(before_state),
+        "output_state_after": list(after_state),
         "errors": parsed["errors"],
         "warnings": parsed["warnings"],
         "new_output": delta_text[:8000],
         "item_delta": delta_items,
-        "waited_seconds": wait_seconds,
+        "waited_seconds": waited,
     }
 
 
@@ -495,6 +527,17 @@ def _selftest() -> None:
         assert not verify_enabled({"verify_game": "off"}, root) and verify_enabled({"verify_game": "on"}, None)
         (root / "custom.exe").write_bytes(b"")
         assert verify_enabled({"game_exe": "custom.exe"}, root)
+        with tempfile.TemporaryDirectory() as gate:
+            base = Path(gate)
+            save = base / "Saves" / "Save0"
+            save.mkdir(parents=True)
+            written = write_code(save, "main", "print(1)\n")
+            assert written["bytes"] > 0 and written["backup"] is None
+            assert not [p for p in save.iterdir() if ".tmp-" in p.name]
+            assert output_state(base) == (0, 0)
+            (base / "output.txt").write_text("x\n", encoding="utf-8")
+            assert output_state(base) != (0, 0)
+            assert callable(stop_game_keys)
         print("selftest ok")
 
 

@@ -46,3 +46,12 @@
 ```powershell
 python tfr.py
 ```
+
+## 更新记录（2026-11-13）
+
+- `tfr_run action=stop` 只按 Shift+F5 停住，不会再按 F5 重启（新增 `tfr.stop_game_keys`）。
+- 写代码统一走 `_check_write`：`allow_write=false` 时 `tfr_solve apply` 和 watcher 开关都会被拒绝。
+- `run_and_check` 改成轮询 output.txt 的 mtime+大小，返回 `output_changed` 与 `output_state_before/after`，不再靠固定睡眠猜结果。
+- 监视循环停止时会 `cancel()`，避免再 start 出现两个循环重复发键。
+- 临时文件名带时间戳，多个写入者不再共用同一个 `.tmp`。
+

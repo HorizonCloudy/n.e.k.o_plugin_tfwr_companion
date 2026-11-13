@@ -164,10 +164,24 @@ class TfwrCompanionPlugin(NekoPluginBase):
         if not bool(cfg.get("allow_input", True)):
             raise SdkError("配置里 allow_input=false；请手动按 F5，再用 tfr_run action=check 验收")
         if action == "stop":
-            return {"sent": await asyncio.to_thread(tfr.send_game_keys, exe=exe, stop_first=True)}
+            return {"sent": await asyncio.to_thread(tfr.stop_game_keys, exe=exe)}
         if action == "run":
             return await asyncio.to_thread(tfr.run_and_check, user, sdir, wait_seconds, exe)
         raise SdkError(f"未知 action：{action}")
+
+    async def _stop_watch_task(self) -> None:
+        """等待监视循环退出；超时就 cancel。不然再 start 会出现两个循环重复发键。"""
+        task = self._watch_task
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._watch_task = None
 
     def _watch_status(self) -> dict:
         return {
@@ -187,12 +201,7 @@ class TfwrCompanionPlugin(NekoPluginBase):
             return self._watch_status()
         if action == "stop":
             self._watch_stop.set()
-            if self._watch_task:
-                try:
-                    await asyncio.wait_for(self._watch_task, timeout=5)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-            self._watch_task = None
+            await self._stop_watch_task()
             return self._watch_status()
         return self._watch_status()
 
@@ -301,7 +310,7 @@ class TfwrCompanionPlugin(NekoPluginBase):
         except Exception as exc:
             return Err(SdkError(f"{type(exc).__name__}: {exc}"))
 
-    @plugin_entry(id="tfr_run", name="执行与验收", description="run=Shift+F5 再 F5 并对比输出；stop=只按 Shift+F5；check=只读最近输出。")
+    @plugin_entry(id="tfr_run", name="执行与验收", description="run=Shift+F5 再 F5 并对比输出；stop=只按 Shift+F5 停住，不会再按 F5；check=只读最近输出。")
     async def tfr_run(
         self,
         action: Annotated[str, "run / stop / check"] = "run",
@@ -488,9 +497,5 @@ class TfwrCompanionPlugin(NekoPluginBase):
     async def on_shutdown(self, **_):
         if self._watch_task and not self._watch_task.done():
             self._watch_stop.set()
-            try:
-                await asyncio.wait_for(self._watch_task, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            self._watch_task = None
+            await self._stop_watch_task()
         return Ok({"status": "stopped"})
