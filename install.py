@@ -1,8 +1,8 @@
 """Startup preparation for tfwr_companion.
 
 There is no external DLL to install. The game's own ``file watcher`` option is
-the integration point, so this ensures it is enabled whenever the game is
-closed. Nothing is written while the game is running.
+the integration point, so at plugin startup this enables it if the game is
+closed. Nothing is written while the game is running, and nothing retries later.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def install(cfg: dict) -> dict:
             "stage": "pending",
             "game": str(game),
             "file_watcher": watcher,
-            "reason": "游戏运行中；退出后会自动开启 file watcher",
+            "reason": "游戏运行中；请退出游戏后重启插件，或用 tfr_code action=watcher value=enabled 开启 file watcher",
             "mods": [],
         }
     tfr.set_option(user, "file watcher", "enabled")

@@ -37,11 +37,14 @@ save_name = "Save0"
 
 game_exe = "TheFarmerWasReplaced.exe"
 
-# 游戏安装目录。留空 = 自动探测常见 Steam 路径。
+# 游戏安装目录。留空 = 从 Steam 库（libraryfolders.vdf）自动探测。
 game_dir = ""
 
-# 写代码开关
+# 写盘开关（tfr_code write / watcher、tfr_solve apply、启动时自动开 file watcher 都受它约束）
 allow_write = true
+
+# 游戏验证：auto = 检测到游戏安装才开；on；off。开启时写代码 / 改 file watcher 后会回读校验（结果带 verified）。
+verify_game = "auto"
 
 # 允许把游戏窗口切到前台并发送 Shift+F5 / F5。关闭后 tfr_run 只能做只读验收。
 allow_input = true

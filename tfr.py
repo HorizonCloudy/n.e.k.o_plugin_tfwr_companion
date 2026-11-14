@@ -24,11 +24,13 @@ from datetime import datetime
 from pathlib import Path
 
 GAME_EXE = "TheFarmerWasReplaced.exe"
-STEAM_CANDIDATES = (
-    r"E:\Program Files (x86)\Steam\steamapps\common\The Farmer Was Replaced",
-    r"C:\Program Files (x86)\Steam\steamapps\common\The Farmer Was Replaced",
-    r"D:\SteamLibrary\steamapps\common\The Farmer Was Replaced",
+# 没有 libraryfolders.vdf 时的兜底库根目录；有 vdf 就以 vdf 为准。
+STEAM_ROOTS = (
+    r"E:\Program Files (x86)\Steam",
+    r"C:\Program Files (x86)\Steam",
+    r"D:\SteamLibrary",
 )
+VDF_PATH_RE = re.compile(r'"path"\s+"([^"]+)"')
 HEAD_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<kind>def|class)\s+(?P<name>\w+)")
 CODE_NAME_RE = re.compile(r"^[A-Za-z_]\w*$")
 
@@ -51,10 +53,47 @@ def resolve_game_dir(cfg: dict | None = None) -> Path | None:
     raw = str((cfg or {}).get("game_dir") or "").strip()
     if raw:
         return Path(raw)
-    for candidate in STEAM_CANDIDATES:
-        if (Path(candidate) / GAME_EXE).exists():
-            return Path(candidate)
+    for lib in steam_libraries():
+        path = lib / "steamapps" / "common" / "The Farmer Was Replaced"
+        if (path / GAME_EXE).exists():
+            return path
     return None
+
+
+def vdf_library_paths(text: str) -> list[Path]:
+    """libraryfolders.vdf 里每个库的 "path"（反斜杠是转义过的）。"""
+    return [Path(raw.replace("\\\\", "\\")) for raw in VDF_PATH_RE.findall(text or "")]
+
+
+def steam_libraries() -> list[Path]:
+    """注册表 SteamPath + 兜底根目录，再展开各自 libraryfolders.vdf 里的库。"""
+    roots = [Path(r) for r in STEAM_ROOTS]
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+            roots.insert(0, Path(winreg.QueryValueEx(key, "SteamPath")[0]))
+    except (ImportError, OSError):
+        pass
+    libs: list[Path] = []
+    for root in roots:
+        try:
+            text = (root / "steamapps" / "libraryfolders.vdf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for lib in [root, *vdf_library_paths(text)]:
+            if lib not in libs:
+                libs.append(lib)
+    return libs
+
+
+def verify_enabled(cfg: dict | None, game: Path | None) -> bool:
+    """verify_game：auto = 检测到游戏安装才开；on / off 强制开关。"""
+    mode = str((cfg or {}).get("verify_game", "auto")).strip().lower()
+    if mode == "auto":
+        exe = str((cfg or {}).get("game_exe") or GAME_EXE)
+        return bool(game and (Path(game) / exe).exists())
+    return mode in ("on", "true")
 
 
 def save_dir(user: Path, save_name: str = "Save0") -> Path:
@@ -182,7 +221,7 @@ def code_path(sdir: Path, name: str) -> Path:
     return path
 
 
-def write_code(sdir: Path, name: str, code: str) -> dict:
+def write_code(sdir: Path, name: str, code: str, verify: bool = False) -> dict:
     path = code_path(sdir, name)
     if len(code.encode("utf-8")) > 200_000:
         raise ValueError("代码超过 200KB，拒绝写入")
@@ -193,10 +232,13 @@ def write_code(sdir: Path, name: str, code: str) -> dict:
         backup = bdir / f"{path.name}.{now_stamp()}.bak"
         shutil.copy2(path, backup)
     text = (code or "").replace("\r\n", "\n").replace("\r", "\n")
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
-    return {"file": path.name, "bytes": len(text.encode("utf-8")), "backup": str(backup) if backup else None}
+    out = {"file": path.name, "bytes": len(text.encode("utf-8")), "backup": str(backup) if backup else None}
+    if verify:
+        out["verified"] = path.read_text(encoding="utf-8") == text
+    return out
 
 
 # ------------------------------------------------------------------ options
@@ -236,7 +278,7 @@ def set_option(user: Path, key: str, value: str) -> dict:
         lines.append(f"{key} = {value}")
     backup = path.with_name(f"{path.name}.bak-{now_stamp()}")
     shutil.copy2(path, backup)
-    tmp = path.with_name(".options.txt.tmp")
+    tmp = path.with_name(f".options.txt.tmp-{time.time_ns()}")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     return {"option": key, "value": value, "backup": str(backup)}
@@ -270,6 +312,15 @@ def output_path(user: Path) -> Path:
 def read_output(user: Path) -> str:
     path = output_path(user)
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+
+def output_state(user: Path) -> tuple[int, int]:
+    """output.txt 的 (mtime_ns, 字节数)。用来判断这次按键后游戏到底有没有写新输出。"""
+    try:
+        st = output_path(user).stat()
+    except OSError:
+        return 0, 0
+    return st.st_mtime_ns, st.st_size
 
 
 def parse_output(text: str) -> dict:
@@ -328,8 +379,11 @@ def find_window(pid: int):
     return (titled or [hwnd for hwnd, _ in found] or [None])[0]
 
 
-def send_game_keys(exe: str = GAME_EXE, stop_first: bool = True) -> dict:
-    """把游戏窗口切到前台，Shift+F5 停，再 F5 开。只认游戏进程的窗口。"""
+def send_game_keys(exe: str = GAME_EXE, stop_first: bool = True, press_run: bool = True) -> dict:
+    """把游戏窗口切到前台再发键。stop_first 指定先按 Shift+F5 停，press_run 指定再按 F5 开。
+
+    只认游戏进程的窗口。只想停不想重新开，调 stop_game_keys()。
+    """
     if os.name != "nt":
         raise RuntimeError("只支持 Windows")
     pid = game_pid(exe)
@@ -367,21 +421,39 @@ def send_game_keys(exe: str = GAME_EXE, stop_first: bool = True) -> dict:
         user32.keybd_event(vk, 0, 0, 0)
         user32.keybd_event(vk, 0, keyup, 0)
 
+    steps = []
     if stop_first:
         user32.keybd_event(vk_shift, 0, 0, 0)
         tap(vk_f5)
         user32.keybd_event(vk_shift, 0, keyup, 0)
+        steps.append("Shift+F5")
         time.sleep(0.4)
-    tap(vk_f5)
-    return {"pid": pid, "hwnd": int(hwnd), "sent": "Shift+F5 then F5"}
+    if press_run:
+        tap(vk_f5)
+        steps.append("F5")
+    return {"pid": pid, "hwnd": int(hwnd), "sent": " then ".join(steps)}
+
+
+def stop_game_keys(exe: str = GAME_EXE) -> dict:
+    """只按 Shift+F5 停住执行，不再按 F5 重启。"""
+    return send_game_keys(exe=exe, stop_first=True, press_run=False)
 
 
 def run_and_check(user: Path, sdir: Path, wait_seconds: float = 6.0, exe: str = GAME_EXE) -> dict:
     before_text = read_output(user)
+    before_state = output_state(user)
     before_items = items(read_save(sdir))
     sent = send_game_keys(exe=exe)
-    time.sleep(max(1.0, min(float(wait_seconds or 6), 60.0)))
+    limit = max(1.0, min(float(wait_seconds or 6), 60.0))
+    started = time.monotonic()
+    deadline = started + limit
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        if output_state(user) != before_state:
+            break
+    waited = round(min(limit, time.monotonic() - started), 2)
     after_text = read_output(user)
+    after_state = output_state(user)
     after_items = items(read_save(sdir))
 
     delta_text = after_text[len(before_text):] if after_text.startswith(before_text) else after_text
@@ -402,12 +474,14 @@ def run_and_check(user: Path, sdir: Path, wait_seconds: float = 6.0, exe: str = 
     return {
         "verdict": verdict,
         "sent": sent,
-        "output_changed": after_text != before_text,
+        "output_changed": after_state != before_state,
+        "output_state_before": list(before_state),
+        "output_state_after": list(after_state),
         "errors": parsed["errors"],
         "warnings": parsed["warnings"],
         "new_output": delta_text[:8000],
         "item_delta": delta_items,
-        "waited_seconds": wait_seconds,
+        "waited_seconds": waited,
     }
 
 
@@ -442,12 +516,28 @@ def _selftest() -> None:
         (root / "output.txt").write_text("Warning: x\n", encoding="utf-8")
 
         assert list_code_files(sdir) == ["main"]
-        written = write_code(sdir, "main", "print('bye')\r\n")
-        assert written["backup"] and read_code(sdir, "main") == "print('bye')\n"
+        written = write_code(sdir, "main", "print('bye')\r\n", verify=True)
+        assert written["backup"] and written["verified"] and read_code(sdir, "main") == "print('bye')\n"
         assert set_option(root, "file watcher", "enabled")["value"] == "enabled"
         assert read_options(root)["file watcher"] == "enabled"
         assert items(read_save(sdir)) == {"hay": 5.0}
         assert parse_output(read_output(root))["warnings"] == ["Warning: x"]
+        vdf = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"E:\\\\Steam"\n\t}\n}\n'
+        assert vdf_library_paths(vdf) == [Path(r"E:\Steam")]
+        assert not verify_enabled({"verify_game": "off"}, root) and verify_enabled({"verify_game": "on"}, None)
+        (root / "custom.exe").write_bytes(b"")
+        assert verify_enabled({"game_exe": "custom.exe"}, root)
+        with tempfile.TemporaryDirectory() as gate:
+            base = Path(gate)
+            save = base / "Saves" / "Save0"
+            save.mkdir(parents=True)
+            written = write_code(save, "main", "print(1)\n")
+            assert written["bytes"] > 0 and written["backup"] is None
+            assert not [p for p in save.iterdir() if ".tmp-" in p.name]
+            assert output_state(base) == (0, 0)
+            (base / "output.txt").write_text("x\n", encoding="utf-8")
+            assert output_state(base) != (0, 0)
+            assert callable(stop_game_keys)
         print("selftest ok")
 
 
